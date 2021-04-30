@@ -9,11 +9,18 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
 /** A heterogeneous, restricted, managed (heterogeneous) vault that targets ERC-1155 conforming contracts. */
 contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
+    /** @dev The version of the contract. */
+    uint256 public _version = 1;
+
     /** @dev The address of the user that is currently depositing tokens. This will not be persisted, to reduce gas usage. */
     address private _depositor;
 
-    /** @dev  The amount of mintable / burnable ERC-20 tokens for each action. */
-    uint256 private _baseWrappedAmount;
+    /**
+     * @dev The amount of tokens minted on deposits and burned on withdrawals. If these are not equal, then the vault is a
+     * fractionalization vault (recommended to have single-token vault).
+     */
+    uint256 private _parityDepositAmount;
+    uint256 private _parityWithdrawalAmount;
 
     /** @dev The whitelist of contracts that can be vaulted. */
     address[] private _coreAddresses;
@@ -26,6 +33,19 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     address[] private _tokenContracts;
     uint256[] private _tokenIds;
     uint256[] private _tokenCounts;
+
+    /**
+     * @dev Used for token id filtering, on a per contract basis.
+     * See:
+     *    addTokenFilters()
+     *    canDepositToken()
+     *    clearTokenFilters()
+     */
+    mapping(address => uint256[]) _filteringDataStart;
+    mapping(address => uint256[]) _filteringDataEnd;
+
+    // The number of id filter ranges cannot equal or exceed this value (2^255 - 1), or the binary search will overflow.
+    uint256 private constant FI_MAX_RANGES = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
 
     /**
      * @dev The mapping of token ids to their index, 1-based.
@@ -61,29 +81,36 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     // We include this here instead of the `nonReentrant` modifier to reduce gas costs. See OpenZeppelin - ReentrancyGuard for more.
     uint256 private constant S_NOT_ENTERED = 1;
     uint256 private constant S_ENTERED = 2;
-    uint256 private constant S_FROZEN = 2;
+    uint256 private constant S_FROZEN = 3;
     uint256 private _status;
 
     /**
      * @param name The name of the wrapped token.
      * @param symbol The symbol of the wrapped token.
-     * @param baseWrappedAmount The price (in parity tokens) of an individual ERC-1155 token. Use '0' for the default of 10^18.
+     * @param parityDepositAmount The amount of parity tokens received when depositing each NFT. Use '0' for the default of 10^18.
+     * @param parityWithdrawalAmount The amount of parity tokens spent when withdrawing each NFT. Use '0' for the default of 10^18.
      * @param contractAddresses The addresses of the ERC-1155 contracts whose tokens will be stored in this vault.
      */
 	constructor (
         string memory name,
         string memory symbol,
-        uint256 baseWrappedAmount,
+        uint256 parityDepositAmount,
+        uint256 parityWithdrawalAmount,
         address[] memory contractAddresses,
         address owner,
         bool restrictDeposits,
         bool restrictWithdrawals
     ) ERC20(name, symbol) public {
-        // Set the token ratio, defaulting to 10^18.
-        if (baseWrappedAmount == 0) {
-            _baseWrappedAmount = uint256(10) ** decimals();
+        // Set the token ratios, defaulting to 10^18.
+        if (parityDepositAmount == 0) {
+            _parityDepositAmount = 10**18;
         } else {
-            _baseWrappedAmount = baseWrappedAmount;
+            _parityDepositAmount = parityDepositAmount;
+        }
+        if (parityWithdrawalAmount == 0) {
+            _parityWithdrawalAmount = 10**18;
+        } else {
+            _parityWithdrawalAmount = parityWithdrawalAmount;
         }
 
         // Add the first set of contracts.
@@ -100,15 +127,14 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         _addressRoles[owner] = 0x7; // R_IS_ADMIN | R_CAN_WITHDRAW | R_CAN_DEPOSIT;
 
         // Set the global allows.
-        if (restrictDeposits && restrictWithdrawals) {
-            _roleRestrictions = WL_RESTRICT_ALL;
-        } else if (restrictDeposits) {
-            _roleRestrictions = WL_RESTRICT_DEPOSITS;
-        } else if (restrictWithdrawals) {
-            _roleRestrictions = WL_RESTRICT_WITHDRAWALS;
-        } else {
-            _roleRestrictions = WL_RESTRICT_NONE;
+        uint256 roleRestrictions;
+        if (restrictDeposits) {
+            roleRestrictions |= WL_RESTRICT_DEPOSITS;
         }
+        if (restrictWithdrawals) {
+            roleRestrictions |= WL_RESTRICT_WITHDRAWALS;
+        }
+        _roleRestrictions = roleRestrictions;
 
         // Set us up for reentrancy guarding.
         _status = S_NOT_ENTERED;
@@ -134,16 +160,73 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     /** Fired when a contract has been removed. */
     event ContractAddressRemoved(address contractAddress);
 
+    /** Fired when token filtering is added for a contract. */
+    event FilteringAdded(address contractAddress);
+
+    /** Fired when token filtering is cleared for a contract. */
+    event FilteringCleared(address contractAddress);
+
+    /** Fired to note information to external Oracles. */
+    event Oracle(bytes data);
+
     /// Token Details ///
 
+    /** Checks to see if a token can be deposited for a given contract, independent of whether or not the contract is allowed. */
+    function canDepositToken(address tokenContract, uint256 tokenId) public view returns (bool) {
+        // Get the filtering data for this contract. If there is no filtering data, then there is no restriction on filtering. 
+        uint256[] storage filteringDataStart = _filteringDataStart[tokenContract] ;
+        if (filteringDataStart.length == 0) {
+            return true;
+        }
+
+        // Do the binary search.
+        uint256 low;
+        uint256 high = filteringDataStart.length - 1;
+        uint256 nearestIndex = FI_MAX_RANGES;
+        while (low <= high) {
+            uint256 mid = (low + high) >> 1;
+            uint256 midVal = filteringDataStart[mid];
+
+            // We found an exact match.
+            if (midVal == tokenId) {
+                return true;
+            }
+
+            // We found a possible candidate.
+            if (midVal < tokenId) {
+                nearestIndex = mid;
+                low = mid + 1;
+            }
+            // Otherwise continue the search.
+            else {
+                // We are underflowing, so we know we've reached the end.
+                if (mid == 0) {
+                    break;
+                }
+                high = mid - 1;
+            }
+        }
+
+        return
+            // We did not find an potential index.
+               nearestIndex != FI_MAX_RANGES
+
+            // We already know that the start value is <= the target value, so we only need to compare against the end value.
+            && tokenId <= _filteringDataEnd[tokenContract][nearestIndex];
+    }
+
     /** Returns the details of a specific contract. */
-    function contractAt(uint256 index) external view returns (uint256[3] memory) {
+    function contractAt(uint256 index) external view returns (uint256[2] memory) {
         address contractAddress = _coreAddresses[index];
         return [
             uint256(contractAddress),
-            _contractTokenCounts[index],
-            _coreAddressIndices[contractAddress]
+            _contractTokenCounts[index]
         ];
+    }
+
+    /** Returns the index of a specific contract. */
+    function getContractIndex(address contractAddress) external view returns (uint256) {
+        return _coreAddressIndices[contractAddress];
     }
 
     /**
@@ -275,6 +358,55 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         emit ContractAddressAdded(contractAddress);
     }
 
+    /**
+     * Add token filters for a contract. The ids must be sorted and valid, and are appended to the current list of filters.
+     *
+     * A valid id for [[start .. end], ...] has:
+     *  start_i <= end_i
+     *  start_i+1 > end_i
+     */
+    function addTokenFilters(address contractAddress, uint256[] calldata startIds, uint256[] calldata endIds) external {
+        uint256 contractIndex = _coreAddressIndices[contractAddress];
+        uint256 count = startIds.length;
+        uint256[] storage filteringDataStart = _filteringDataStart[contractAddress];
+        uint256[] storage filteringDataEnd = _filteringDataEnd[contractAddress];
+        uint256 currentCount = filteringDataStart.length;
+        require(
+            // Reentrancy guard. We require the contract to be frozen for extra security.
+            _status == S_FROZEN
+
+            // Caller must be an admin.
+            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
+
+            // Make sure the contract is tracked.
+            && contractIndex > 0
+
+            // Make sure we can't overflow on the binary search.
+            && currentCount + count < FI_MAX_RANGES
+
+            // We don't check the length of the arrays are the same since the EVM will revert ('invalid opcode').
+        , "Not authorized");
+        
+        // Get the latest end value, if it exists.
+        uint256 end;
+        if (currentCount > 0) {
+            end = filteringDataEnd[currentCount - 1];
+        }
+
+        // Add the new filters, checking to make sure they are valid.
+        for (uint256 i; i < count; i ++) {
+            uint256 start = startIds[i];
+            require((start > end || end == 0) && start <= endIds[i], "Not sorted");
+            end = endIds[i];
+
+            filteringDataStart.push(start);
+            filteringDataEnd.push(end);
+        }
+
+        // Hello world!
+        emit FilteringAdded(contractAddress);
+    }
+
     /** Change the currently tracked contract. */
     function changeContractAddress(address oldContract, address newContract) external {
         uint256 index = _coreAddressIndices[oldContract];
@@ -303,6 +435,28 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         emit ContractAddressChanged(oldContract, newContract);
     }
 
+    /** Clears the token filtering for a specific contract. */
+    function clearTokenFilters(address contractAddress) external {
+        uint256 contractIndex = _coreAddressIndices[contractAddress];
+        require(
+            // Reentrancy guard. We require the contract to be frozen for extra security.
+            _status == S_FROZEN
+
+            // Caller must be an admin.
+            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
+
+            // Make sure the contract is tracked.
+            &&  contractIndex > 0
+        , "Not authorized");
+
+        // Clear the filters.
+        delete _filteringDataStart[contractAddress];
+        delete _filteringDataEnd[contractAddress];
+
+        // Hello world!
+        emit FilteringCleared(contractAddress);
+    }
+
     /** Lock out all non-management aspects of the contract. Token transfers are still allowed. */
     function freeze() external {
         require(
@@ -311,6 +465,20 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         , "Not authorized");
 
         _status = S_FROZEN;
+    }
+
+    /** Allows for admins to broadcast an oracable message. */
+    function oracle(bytes calldata data) external {
+        require(
+            // Reentrancy guard.
+            (_status == S_NOT_ENTERED || _status == S_FROZEN)
+
+            // Caller must be an admin.
+            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
+        , "Not authorized");
+
+        // Hello world!
+        emit Oracle(data);
     }
 
     /** Remove a tracked contract from the vault. This will fail if there are any tokens vaulted for this contract. */
@@ -370,7 +538,6 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
         // Accept this transfer.
         return 0xf23a6e61; // bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))
-         // TODO: Return as constant
     }
 
     /**
@@ -458,13 +625,27 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
                 continue;
             }
 
-            // Check to see if we've already stored this token. If we have, then we only need to increase the tracked count.
+            // Limit the max depositable amount to be the user's current balance, skipping this token if they have no balance.
             uint256 tokenId = tokenIds[i];
+            uint256 currentUserBalance = tokenContract.balanceOf(msg.sender, tokenId);
+            if (currentUserBalance == 0) {
+                continue;
+            }
             uint256 tokenCount = tokenCounts[i];
-            uint256 currentIndex__currentBalance = _indices[(contractIndex << CONTRACT_INDEX_OFFSET) | tokenId];
+            if (tokenCount > currentUserBalance) {
+                tokenCount = currentUserBalance;
+            }
+
+            // Make sure we can deposit the token according to the token filtering rules.
+            if (!canDepositToken(address(tokenContract), tokenId)) {
+                continue;
+            }
+
+            // Check to see if we've already stored this token. If we have, then we only need to increase the tracked count.
+            uint256 currentIndex = _indices[(contractIndex << CONTRACT_INDEX_OFFSET) | tokenId];
             _contractTokenCounts[contractIndex - 1] += tokenCount;
-            if (currentIndex__currentBalance > 0) {
-                _tokenCounts[currentIndex__currentBalance - 1] += tokenCount;
+            if (currentIndex > 0) {
+                _tokenCounts[currentIndex - 1] += tokenCount;
             } else {
                 // Store it in the vault. We merge together the index of a token's contract with its token id to store in
                 // `_indices`, left-shifting the index as much as we can. This works so long as an NFT id isn't >2^200. That is a
@@ -483,14 +664,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
             // We need to know the prior balance in order to validate that the token contract did the full transfer. We will adjust
             // the intended token count value if they are trying to deposit more than they own. If they don't have any balance at all,
             // then we'll just move on to the next token.
-            currentIndex__currentBalance = tokenContract.balanceOf(msg.sender, tokenId);
             uint256 currentVaultBalance = tokenContract.balanceOf(address(this), tokenId);
-            if (currentIndex__currentBalance == 0) {
-                continue;
-            }
-            if (tokenCount > currentIndex__currentBalance) {
-                tokenCount = currentIndex__currentBalance;
-            }
 
             // Track the true number to be minted.
             mintCount += tokenCount;
@@ -500,7 +674,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
             // Validate the transfer balances.
             require(
-                   tokenContract.balanceOf(msg.sender, tokenId)    == (currentIndex__currentBalance - tokenCount)
+                   tokenContract.balanceOf(msg.sender, tokenId)    == (currentUserBalance - tokenCount)
                 && tokenContract.balanceOf(address(this), tokenId) == (currentVaultBalance + tokenCount)
             , "Transfer failed");
 
@@ -510,7 +684,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
         // Give them the wrapped ERC-20 token.
         if (mintCount > 0) {
-            _mint(depositor, mintCount * _baseWrappedAmount);
+            _mint(depositor, mintCount * _parityDepositAmount);
         }
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
@@ -548,7 +722,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
         // Take the wrapped ERC-20 tokens.
         if (burnCount > 0) {
-            _burn(msg.sender, burnCount * _baseWrappedAmount);
+            _burn(msg.sender, burnCount * _parityWithdrawalAmount);
         }
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
@@ -613,7 +787,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
         // Take the wrapped ERC-20 tokens.
         if (burnCount > 0) {
-            _burn(msg.sender, burnCount * _baseWrappedAmount);
+            _burn(msg.sender, burnCount * _parityWithdrawalAmount);
         }
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).

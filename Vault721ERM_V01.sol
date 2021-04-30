@@ -12,8 +12,12 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     // The address of the user that is wrapping / unwrapping tokens. This will not be persisted, to reduce gas usage.
     address _depositor;
 
-    // The amount of mintable / burnable ERC-20 tokens for each action.
-    uint256 private _baseWrappedAmount;
+    /**
+     * @dev The amount of tokens minted on deposits and burned on withdrawals. If these are not equal, then the vault is a
+     * fractionalization vault (recommended to have single-token vault).
+     */
+    uint256 private _parityDepositAmount;
+    uint256 private _parityWithdrawalAmount;
 
     /** @dev The whitelist of contracts that can be vaulted. */
     address[] private _coreAddresses;
@@ -25,6 +29,19 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     // The tokens stored in the vault and their contracts' address.
     uint256[] private _tokenIds;
     address[] private _tokenContracts;
+
+    /**
+     * @dev Used for token id filtering, on a per contract basis.
+     * See:
+     *    addTokenFilters()
+     *    canDepositToken()
+     *    clearTokenFilters()
+     */
+    mapping(address => uint256[]) _filteringDataStart;
+    mapping(address => uint256[]) _filteringDataEnd;
+
+    // The number of id filter ranges cannot equal or exceed this value (2^255 - 1), or the binary search will overflow.
+    uint256 private constant FI_MAX_RANGES = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
 
     /**
      * @dev The mapping of token ids to their index, 1-based.
@@ -60,30 +77,37 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     // We include this here instead of the `nonReentrant` modifier to reduce gas costs. See OpenZeppelin - ReentrancyGuard for more.
     uint256 private constant S_NOT_ENTERED = 1;
     uint256 private constant S_ENTERED = 2;
-    uint256 private constant S_FROZEN = 2;
+    uint256 private constant S_FROZEN = 3;
 
     uint256 private _status;
 
     /**
      * @param name The name of the wrapped token.
      * @param symbol The symbol of the wrapped token.
-     * @param baseWrappedAmount The price (in parity tokens) of an individual ERC-721 token. Use '0' for the default of 10^18.
+     * @param parityDepositAmount The amount of parity tokens received when depositing each NFT. Use '0' for the default of 10^18.
+     * @param parityWithdrawalAmount The amount of parity tokens spent when withdrawing each NFT. Use '0' for the default of 10^18.
      * @param contractAddresses The addresses of the ERC-721 contracts whose tokens will be stored in this vault.
      */
 	constructor (
         string memory name,
         string memory symbol,
-        uint256 baseWrappedAmount,
+        uint256 parityDepositAmount,
+        uint256 parityWithdrawalAmount,
         address[] memory contractAddresses,
         address owner,
         bool restrictDeposits,
         bool restrictWithdrawals
     ) ERC20(name, symbol) public {
-        // Set the token ratio, defaulting to 10^18.
-        if (baseWrappedAmount == 0) {
-            _baseWrappedAmount = uint256(10) ** decimals();
+        // Set the token ratios, defaulting to 10^18.
+        if (parityDepositAmount == 0) {
+            _parityDepositAmount = 10**18;
         } else {
-            _baseWrappedAmount = baseWrappedAmount;
+            _parityDepositAmount = parityDepositAmount;
+        }
+        if (parityWithdrawalAmount == 0) {
+            _parityWithdrawalAmount = 10**18;
+        } else {
+            _parityWithdrawalAmount = parityWithdrawalAmount;
         }
 
         // Add the first set of contracts.
@@ -92,6 +116,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         for (uint256 i; i < contractsCount; i ++) {
             contractAddress = contractAddresses[i];
             _coreAddresses.push(contractAddress);
+            _contractTokenCounts.push(0);
             _coreAddressIndices[contractAddress] = i + 1;
         }
 
@@ -99,15 +124,14 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         _addressRoles[owner] = 0x7; // R_IS_ADMIN | R_CAN_WITHDRAW | R_CAN_DEPOSIT;
 
         // Set the global allows.
-        if (restrictDeposits && restrictWithdrawals) {
-            _roleRestrictions = WL_RESTRICT_ALL;
-        } else if (restrictDeposits) {
-            _roleRestrictions = WL_RESTRICT_DEPOSITS;
-        } else if (restrictWithdrawals) {
-            _roleRestrictions = WL_RESTRICT_WITHDRAWALS;
-        } else {
-            _roleRestrictions = WL_RESTRICT_NONE;
+        uint256 roleRestrictions;
+        if (restrictDeposits) {
+            roleRestrictions |= WL_RESTRICT_DEPOSITS;
         }
+        if (restrictWithdrawals) {
+            roleRestrictions |= WL_RESTRICT_WITHDRAWALS;
+        }
+        _roleRestrictions = roleRestrictions;
 
         // Set us up for reentrancy guarding.
         _status = S_NOT_ENTERED;
@@ -133,16 +157,73 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     /** Fired when a contract has been removed. */
     event ContractAddressRemoved(address contractAddress);
 
+    /** Fired when token filtering is added for a contract. */
+    event FilteringAdded(address contractAddress);
+
+    /** Fired when token filtering is cleared for a contract. */
+    event FilteringCleared(address contractAddress);
+
+    /** Fired to note information to external Oracles. */
+    event Oracle(bytes data);
+
     /// Token Details ///
+    
+    /** Checks to see if a token can be deposited for a given contract, independent of whether or not the contract is allowed. */
+    function canDepositToken(address tokenContract, uint256 tokenId) public view returns (bool) {
+        // Get the filtering data for this contract. If there is no filtering data, then there is no restriction on filtering. 
+        uint256[] storage filteringDataStart = _filteringDataStart[tokenContract] ;
+        if (filteringDataStart.length == 0) {
+            return true;
+        }
+
+        // Do the binary search.
+        uint256 low;
+        uint256 high = filteringDataStart.length - 1;
+        uint256 nearestIndex = FI_MAX_RANGES;
+        while (low <= high) {
+            uint256 mid = (low + high) >> 1;
+            uint256 midVal = filteringDataStart[mid];
+
+            // We found an exact match.
+            if (midVal == tokenId) {
+                return true;
+            }
+
+            // We found a possible candidate.
+            if (midVal < tokenId) {
+                nearestIndex = mid;
+                low = mid + 1;
+            }
+            // Otherwise continue the search.
+            else {
+                // We are underflowing, so we know we've reached the end.
+                if (mid == 0) {
+                    break;
+                }
+                high = mid - 1;
+            }
+        }
+
+        return
+            // We did not find an potential index.
+               nearestIndex != FI_MAX_RANGES
+
+            // We already know that the start value is <= the target value, so we only need to compare against the end value.
+            && tokenId <= _filteringDataEnd[tokenContract][nearestIndex];
+    }
 
     /** Returns the details of a specific contract. */
-    function contractAt(uint256 index) external view returns (uint256[3] memory) {
+    function contractAt(uint256 index) external view returns (uint256[2] memory) {
         address contractAddress = _coreAddresses[index];
         return [
             uint256(contractAddress),
-            _contractTokenCounts[index],
-            _coreAddressIndices[contractAddress]
+            _contractTokenCounts[index]
         ];
+    }
+
+    /** Returns the index of a specific contract. */
+    function getContractIndex(address contractAddress) external view returns (uint256) {
+        return _coreAddressIndices[contractAddress];
     }
 
     /**
@@ -266,10 +347,60 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
 
         // Add the contract
         _coreAddresses.push(contractAddress);
+        _contractTokenCounts.push(0);
         _coreAddressIndices[contractAddress] = _coreAddresses.length;
 
         // Hello world!
         emit ContractAddressAdded(contractAddress);
+    }
+
+    /**
+     * Add token filters for a contract. The ids must be sorted and valid, and are appended to the current list of filters.
+     *
+     * A valid id for [[start .. end], ...] has:
+     *  start_i <= end_i
+     *  start_i+1 > end_i
+     */
+    function addTokenFilters(address contractAddress, uint256[] calldata startIds, uint256[] calldata endIds) external {
+        uint256 contractIndex = _coreAddressIndices[contractAddress];
+        uint256 count = startIds.length;
+        uint256[] storage filteringDataStart = _filteringDataStart[contractAddress];
+        uint256[] storage filteringDataEnd = _filteringDataEnd[contractAddress];
+        uint256 currentCount = filteringDataStart.length;
+        require(
+            // Reentrancy guard. We require the contract to be frozen for extra security.
+            _status == S_FROZEN
+
+            // Caller must be an admin.
+            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
+
+            // Make sure the contract is tracked.
+            && contractIndex > 0
+
+            // Make sure we can't overflow on the binary search.
+            && currentCount + count < FI_MAX_RANGES
+
+            // We don't check the length of the arrays are the same since the EVM will revert ('invalid opcode').
+        , "Not authorized");
+        
+        // Get the latest end value, if it exists.
+        uint256 end;
+        if (currentCount > 0) {
+            end = filteringDataEnd[currentCount - 1];
+        }
+
+        // Add the new filters, checking to make sure they are valid.
+        for (uint256 i; i < count; i ++) {
+            uint256 start = startIds[i];
+            require((start > end || end == 0) && start <= endIds[i], "Not sorted");
+            end = endIds[i];
+
+            filteringDataStart.push(start);
+            filteringDataEnd.push(end);
+        }
+
+        // Hello world!
+        emit FilteringAdded(contractAddress);
     }
 
     /** Change the currently tracked contract. */
@@ -300,6 +431,28 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         emit ContractAddressChanged(oldContract, newContract);
     }
 
+    /** Clears the token filtering for a specific contract. */
+    function clearTokenFilters(address contractAddress) external {
+        uint256 contractIndex = _coreAddressIndices[contractAddress];
+        require(
+            // Reentrancy guard. We require the contract to be frozen for extra security.
+            _status == S_FROZEN
+
+            // Caller must be an admin.
+            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
+
+            // Make sure the contract is tracked.
+            &&  contractIndex > 0
+        , "Not authorized");
+
+        // Clear the filters.
+        delete _filteringDataStart[contractAddress];
+        delete _filteringDataEnd[contractAddress];
+
+        // Hello world!
+        emit FilteringCleared(contractAddress);
+    }
+
     /** Lock out all non-management aspects of the contract. Token transfers are still allowed. */
     function freeze() external {
         require(
@@ -308,6 +461,19 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         , "Not authorized");
 
         _status = S_FROZEN;
+    }
+
+    /** Allows for admins to broadcast an oracable message. */
+    function oracle(bytes calldata data) external {
+        require(
+            // Reentrancy guard.
+            (_status == S_NOT_ENTERED || _status == S_FROZEN)
+
+            // Caller must be an admin.
+            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
+        , "Not authorized");
+
+        emit Oracle(data);
     }
     
     /** Remove a tracked contract from the vault. This will fail if there are any tokens vaulted for this contract. */
@@ -366,7 +532,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         require(_coreAddressIndices[msg.sender] > 0,      "Token not allowed in vault");
 
         // Accept this transfer.
-        return IERC721Receiver.onERC721Received.selector; // TODO: Return as constant
+        return IERC721Receiver.onERC721Received.selector;
     }
 
     /// Vault ///
@@ -400,8 +566,8 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
             // exceed their theoretical bounds (e.g., overflow on `_tokenIds.length`). This is functionally impossible given the
             // limitations of our current technology, the design life of this vault, and the current ecosystem of smart contracts.
             //
-            // The second check we are not doing is ensuring that the length of our three arrays are the same. The EVM will revert
-            // ('invalid opcode'), so this is just unnecessary gas. It is self evident that the three arrays should be equal size.
+            // The second check we are not doing is ensuring that the length of our two arrays are the same. The EVM will revert
+            // ('invalid opcode'), so this is just unnecessary gas. It is self evident that the two arrays should be equal size.
         , "Invalid parameters");
         _status = S_ENTERED;
 
@@ -411,16 +577,15 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         // We don't want to keep reading the length from storage.
         uint256 _length = _tokenIds.length;
 
-        // Try and deposit everything.
+        // Set up our variables.
         uint256 tokenId;
-
-        // Try and deposit everything.
         IERC721 tokenContract;
         uint256 contractIndex;
         uint256 mintCount;
         uint256 count = tokenIds.length;
         uint256 i;
 
+        // Try and deposit everything.
         for (i; i < count; i ++) {
             // Make sure that the vault can accept this token's contract. We skip any contracts that aren't whitelisted within
             // this vault. In principle, the vault's contract whitelist should not change frequently, and removals should be
@@ -431,8 +596,21 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
                 continue;
             }
 
-            // Increase the tracked count for this contract.
+            // If the sender hasn't approved this contract for this specific token then it will fail. We have to check for
+            // ownership here to prevent a third party from forcing a deposit. If this vault already owns the token then this will
+            // also fail. This way we can avoid a self-check on existence (since it's not a guaranteed O(1)).
             tokenId = tokenIds[i];
+            if (tokenContract.ownerOf(tokenId) != msg.sender) {
+                // Ignore this token without reverting.
+                continue;
+            }
+
+            // Make sure we can deposit the token according to the token filtering rules.
+            if (!canDepositToken(address(tokenContract), tokenId)) {
+                continue;
+            }
+
+            // Increase the tracked count for this contract.
             _contractTokenCounts[contractIndex - 1]++;
 
             // Store it in the vault. We merge together the index of a token's contract with its token id to store in `_indices`,
@@ -446,14 +624,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
             _tokenContracts.push(address(tokenContract));
             _indices[(contractIndex << CONTRACT_INDEX_OFFSET) | tokenId] = ++_length;
 
-            // Attempt to transfer the token. If the sender hasn't approved this contract for this specific token then it will
-            // fail. We have to check for ownership here to prevent a third party from forcing a deposit. If this vault already
-            // owns the token then this will also fail. This way we can avoid a self-check on existence (since it's not a
-            // guaranteed O(1)).
-            if (tokenContract.ownerOf(tokenId) != msg.sender) {
-                // Ignore this token without reverting.
-                continue;
-            }
+            // Attempt to transfer the token.
             tokenContract.safeTransferFrom(msg.sender, address(this), tokenId);
             
             // Check to make sure the transfer succeded. Here we must have a reversion on failure.
@@ -465,7 +636,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         }
 
         // Give them the wrapped ERC-20 token.
-        _mint(depositor, mintCount * _baseWrappedAmount);
+        _mint(depositor, mintCount * _parityDepositAmount);
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
         _depositor = address(0);
@@ -501,7 +672,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         _withdrawToken(destination, index);
 
         // Take the wrapped ERC-20 tokens.
-        _burn(msg.sender, _baseWrappedAmount);
+        _burn(msg.sender, _parityWithdrawalAmount);
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
         _status = S_NOT_ENTERED;
@@ -561,12 +732,12 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
             ) {
                 continue;
             }
-            _withdrawToken(tokenContract, tokenIndex);
+            _withdrawToken(destination, tokenIndex);
             withdrawnCount++;
         }
 
         // Take the wrapped ERC-20 tokens.
-        _burn(msg.sender, withdrawnCount * _baseWrappedAmount);
+        _burn(msg.sender, withdrawnCount * _parityWithdrawalAmount);
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
         _status = S_NOT_ENTERED;
@@ -577,13 +748,14 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
      *
      * @param destination Who will be receiving the NFT.
      * @param index The index within the vault that will be withdrawn.
-     *
-     * @return The number of withdrawn tokens.
      */
-    function _withdrawToken(address destination, uint256 index) internal returns (uint256) {
+    function _withdrawToken(address destination, uint256 index) internal {
         IERC721 tokenContract = IERC721(_tokenContracts[index]);
         uint256 tokenId = _tokenIds[index];
         uint256 contractIndex = _coreAddressIndices[address(tokenContract)];
+
+        // Decrease the tracked count for this contract.
+        _contractTokenCounts[contractIndex - 1]++;
 
         // Swap and pop the ids and counts.
         uint256 lastIndex = _tokenIds.length - 1;
@@ -605,11 +777,9 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         tokenContract.safeTransferFrom(address(this), destination, tokenId);
 
         // Validate the transfer succeeded.
-        require(tokenContract.ownerOf(tokenId)   == destination, "Transfer failed");
+        require(tokenContract.ownerOf(tokenId) == destination, "Transfer failed");
 
         // Hello world!
         emit TokenWithdrawn(address(tokenContract), tokenId);
-
-        return 1;
     }
 }
