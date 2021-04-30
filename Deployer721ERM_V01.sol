@@ -19,7 +19,8 @@ contract Deployer721ERM_V01 {
      *
      * @param name The name of the wrapped token.
      * @param symbol The symbol of the wrapped token.
-     * @param baseWrappedAmount The price (in parity tokens) of an individual ERC-721 token. Use '0' for the default of 10^18.
+     * @param parityDepositAmount The amount of parity tokens received when depositing each NFT. Use '0' for the default of 10^18.
+     * @param parityWithdrawalAmount The amount of parity tokens spent when withdrawing each NFT. Use '0' for the default of 10^18.
      * @param contractAddresses The addresses of the ERC-721 contracts whose tokens will be stored in this vault.
      * @param restrictDeposits Restricts deposits to those wallets that have been previously authorized (enables whitelist).
      * @param restrictWithdrawals Restricts withdrawals to those wallets that have been previously authorized (enables whitelist).
@@ -29,7 +30,8 @@ contract Deployer721ERM_V01 {
     function deploy(
         string memory name,
         string memory symbol,
-        uint256 baseWrappedAmount,
+        uint256 parityDepositAmount,
+        uint256 parityWithdrawalAmount,
         address[] calldata contractAddresses,
         bool restrictDeposits,
         bool restrictWithdrawals
@@ -42,7 +44,8 @@ contract Deployer721ERM_V01 {
         Vault721ERM_V01 vault = new Vault721ERM_V01(
             name,
             symbol,
-            baseWrappedAmount,
+            parityDepositAmount,
+            parityWithdrawalAmount,
             contractAddresses,
             msg.sender,
             restrictDeposits,
