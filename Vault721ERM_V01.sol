@@ -43,6 +43,9 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     // The number of id filter ranges cannot equal or exceed this value (2^255 - 1), or the binary search will overflow.
     uint256 private constant FI_MAX_RANGES = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
 
+    // The maximum value a uint256 can store.
+    uint256 private constant MAX_SAFE_UINT256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+
     /**
      * @dev The mapping of token ids to their index, 1-based.
      * We merge together the index of the contract and the token id (`CONTRACT_INDEX_OFFSET`), which lets us support a larger vault.
@@ -151,9 +154,6 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     /** Fired when a contract has been added. */
     event ContractAddressAdded(address contractAddress);
 
-    /** Fired when a contract has been migrated. */
-    event ContractAddressChanged(address oldAddress, address newAddress);
-
     /** Fired when a contract has been removed. */
     event ContractAddressRemoved(address contractAddress);
 
@@ -171,14 +171,14 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     /** Checks to see if a token can be deposited for a given contract, independent of whether or not the contract is allowed. */
     function canDepositToken(address tokenContract, uint256 tokenId) public view returns (bool) {
         // Get the filtering data for this contract. If there is no filtering data, then there is no restriction on filtering. 
-        uint256[] storage filteringDataStart = _filteringDataStart[tokenContract] ;
-        if (filteringDataStart.length == 0) {
+        uint256[] storage filteringDataStart = _filteringDataStart[tokenContract];
+        uint256 high = filteringDataStart.length - 1;
+        if (high == MAX_SAFE_UINT256) {
             return true;
         }
 
         // Do the binary search.
         uint256 low;
-        uint256 high = filteringDataStart.length - 1;
         uint256 nearestIndex = FI_MAX_RANGES;
         while (low <= high) {
             uint256 mid = (low + high) >> 1;
@@ -221,15 +221,15 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         ];
     }
 
-    /** Returns the index of a specific contract. */
+    /**
+     * Returns the index of a specific contract. This is one-based, so if the contract is not allowed within the vault the index
+     * is zero. If it is non-zero, subtract one to get the true index.
+     */
     function getContractIndex(address contractAddress) external view returns (uint256) {
         return _coreAddressIndices[contractAddress];
     }
 
-    /**
-     * Check if a token can be withdrawn by its id and its deposit counter. Use `getDepositCounter()` to see the maximum value for
-     * `depositCounter`, if it is unknown. Use `getCurrentDepositCounts()` to see how many of the token are currently deposited.
-     */
+    /** Check if a token can be withdrawn by its contract and id. */
     function getTokenIndex(address tokenContract, uint256 tokenId) external view returns (uint256) {
         uint256 index = _indices[(_coreAddressIndices[tokenContract] << CONTRACT_INDEX_OFFSET) | tokenId];
         require(index > 0, "Token not in vault");
@@ -289,16 +289,18 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
     /**
      * Set the role flags for a given set of users. It's possible, but not recommended, to remove all admins. This will lock out all
      * future role and contract management. Depositor and withdrawal flags will have no affect unless the vault is using this
-     * whitelist to restrict those actions (see: `changeRoleRestrictions()`). It's possible, but not recommended, to set strip admins
+     * whitelist to restrict those actions (see: `changeRoleRestrictions()`). It's possible, but not recommended, to strip admins
      * of deposit/withdrawal permissions.
+     * 
+     * NOTE: This will overwrite any existing permissions for the target user.
      */
-    function setRoles(address[] calldata users, bool enableRoles, bool adminFlag, bool depositorFlag, bool withdrawerFlag) external {
+    function setRoles(address[] calldata users, bool adminFlag, bool depositorFlag, bool withdrawerFlag) external {
         require(
                (_status == S_NOT_ENTERED || _status == S_FROZEN)      // Reentrancy guard.
             && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN // Not admin.
         , "Not authorized");
 
-        // Build up the roles flag assuming that we'll be setting the roles. We'll negate this if we're clearing it.
+        // Build up the new roles flag.
         uint256 rolesFlag;
         if (depositorFlag) {
             rolesFlag |= R_CAN_DEPOSIT;
@@ -314,12 +316,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         uint256 count = users.length;
         uint256 i;
         for (; i < count; i ++) {
-            user = users[i];
-            if (enableRoles) {
-                _addressRoles[user] |= rolesFlag;
-            } else {
-                _addressRoles[user] &= ~rolesFlag;
-            }
+            _addressRoles[users[i]] = rolesFlag;
 
             // Hello world!
             emit RoleChanged(user, _addressRoles[user]);
@@ -401,34 +398,6 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
 
         // Hello world!
         emit FilteringAdded(contractAddress);
-    }
-
-    /** Change the currently tracked contract. */
-    function changeContractAddress(address oldContract, address newContract) external {
-        uint256 index = _coreAddressIndices[oldContract];
-        require(
-            // Reentrancy guard.
-            (_status == S_NOT_ENTERED || _status == S_FROZEN)
-
-            // Caller must be an admin.
-            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
-
-            // Make sure the address is an external contract that is currently being tracked. We don't do any validation on if the
-            // target address is a contract, or even if it supports `IERC721`, since all interactions will revert if either of
-            // those are true.
-            && newContract != address(0)
-            && newContract != address(this)
-            && index > 0
-            && _contractTokenCounts[index - 1] == 0
-        , "Invalid parameters");
-
-        // Change the contract.
-        _coreAddresses[index - 1] = newContract;
-        _coreAddressIndices[oldContract] = 0;
-        _coreAddressIndices[newContract] = index;
-
-        // Hello world!
-        emit ContractAddressChanged(oldContract, newContract);
     }
 
     /** Clears the token filtering for a specific contract. */
@@ -636,6 +605,7 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         }
 
         // Give them the wrapped ERC-20 token.
+        require((mintCount * _parityDepositAmount) / _parityDepositAmount == mintCount);
         _mint(depositor, mintCount * _parityDepositAmount);
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
@@ -669,7 +639,10 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
         _status = S_ENTERED;
 
         // Attempt the withdrawal.
-        _withdrawToken(destination, index);
+        address tokenContract = _tokenContracts[index];
+        uint256 tokenId = _tokenIds[index];
+        uint256 contractIndex = _coreAddressIndices[tokenContract];
+        _withdrawToken(destination, index, IERC721(tokenContract), tokenId, contractIndex);
 
         // Take the wrapped ERC-20 tokens.
         _burn(msg.sender, _parityWithdrawalAmount);
@@ -732,11 +705,12 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
             ) {
                 continue;
             }
-            _withdrawToken(destination, tokenIndex);
+            _withdrawToken(destination, tokenIndex, IERC721(tokenContract), tokenId, contractIndex);
             withdrawnCount++;
         }
 
         // Take the wrapped ERC-20 tokens.
+        require((withdrawnCount * _parityWithdrawalAmount) / _parityWithdrawalAmount == withdrawnCount);
         _burn(msg.sender, withdrawnCount * _parityWithdrawalAmount);
 
         // By storing the original value once again, a refund is triggered (see https://eips.ethereum.org/EIPS/eip-2200).
@@ -749,13 +723,9 @@ contract Vault721ERM_V01 is ERC20, IERC721Receiver {
      * @param destination Who will be receiving the NFT.
      * @param index The index within the vault that will be withdrawn.
      */
-    function _withdrawToken(address destination, uint256 index) internal {
-        IERC721 tokenContract = IERC721(_tokenContracts[index]);
-        uint256 tokenId = _tokenIds[index];
-        uint256 contractIndex = _coreAddressIndices[address(tokenContract)];
-
+    function _withdrawToken(address destination, uint256 index, IERC721 tokenContract, uint256 tokenId, uint256 contractIndex) internal {
         // Decrease the tracked count for this contract.
-        _contractTokenCounts[contractIndex - 1]++;
+        _contractTokenCounts[contractIndex - 1]--;
 
         // Swap and pop the ids and counts.
         uint256 lastIndex = _tokenIds.length - 1;
