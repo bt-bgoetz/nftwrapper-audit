@@ -47,6 +47,9 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     // The number of id filter ranges cannot equal or exceed this value (2^255 - 1), or the binary search will overflow.
     uint256 private constant FI_MAX_RANGES = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
 
+    // The maximum value a uint256 can store.
+    uint256 private constant MAX_SAFE_UINT256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+
     /**
      * @dev The mapping of token ids to their index, 1-based.
      * We merge together the index of the contract and the token id (`CONTRACT_INDEX_OFFSET`), which lets us support a larger vault.
@@ -154,9 +157,6 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     /** Fired when a contract has been added. */
     event ContractAddressAdded(address contractAddress);
 
-    /** Fired when a contract has been migrated. */
-    event ContractAddressChanged(address oldAddress, address newAddress);
-
     /** Fired when a contract has been removed. */
     event ContractAddressRemoved(address contractAddress);
 
@@ -174,14 +174,14 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     /** Checks to see if a token can be deposited for a given contract, independent of whether or not the contract is allowed. */
     function canDepositToken(address tokenContract, uint256 tokenId) public view returns (bool) {
         // Get the filtering data for this contract. If there is no filtering data, then there is no restriction on filtering. 
-        uint256[] storage filteringDataStart = _filteringDataStart[tokenContract] ;
-        if (filteringDataStart.length == 0) {
+        uint256[] storage filteringDataStart = _filteringDataStart[tokenContract];
+        uint256 high = filteringDataStart.length - 1;
+        if (high == MAX_SAFE_UINT256) {
             return true;
         }
 
         // Do the binary search.
         uint256 low;
-        uint256 high = filteringDataStart.length - 1;
         uint256 nearestIndex = FI_MAX_RANGES;
         while (low <= high) {
             uint256 mid = (low + high) >> 1;
@@ -224,15 +224,15 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         ];
     }
 
-    /** Returns the index of a specific contract. */
+    /**
+     * Returns the index of a specific contract. This is one-based, so if the contract is not allowed within the vault the index
+     * is zero. If it is non-zero, subtract one to get the true index.
+     */
     function getContractIndex(address contractAddress) external view returns (uint256) {
         return _coreAddressIndices[contractAddress];
     }
 
-    /**
-     * Check if a token can be withdrawn by its id and its deposit counter. Use `getDepositCounter()` to see the maximum value for
-     * `depositCounter`, if it is unknown. Use `getCurrentDepositCounts()` to see how many of the token are currently deposited.
-     */
+    /** Check if a token can be withdrawn by its contract and id. */
     function getTokenIndex(address tokenContract, uint256 tokenId) external view returns (uint256) {
         uint256 index = _indices[(_coreAddressIndices[tokenContract] << CONTRACT_INDEX_OFFSET) | tokenId];
         require(index > 0, "Token not in vault");
@@ -293,16 +293,18 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
     /**
      * Set the role flags for a given set of users. It's possible, but not recommended, to remove all admins. This will lock out all
      * future role and contract management. Depositor and withdrawal flags will have no affect unless the vault is using this
-     * whitelist to restrict those actions (see: `changeRoleRestrictions()`). It's possible, but not recommended, to set strip admins
+     * whitelist to restrict those actions (see: `changeRoleRestrictions()`). It's possible, but not recommended, to strip admins
      * of deposit/withdrawal permissions.
+     * 
+     * NOTE: This will overwrite any existing permissions for the target user.
      */
-    function setRoles(address[] calldata users, bool enableRoles, bool adminFlag, bool depositorFlag, bool withdrawerFlag) external {
+    function setRoles(address[] calldata users, bool adminFlag, bool depositorFlag, bool withdrawerFlag) external {
         require(
                (_status == S_NOT_ENTERED || _status == S_FROZEN)      // Reentrancy guard.
             && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN // Not admin.
         , "Not authorized");
 
-        // Build up the roles flag assuming that we'll be setting the roles. We'll negate this if we're clearing it.
+        // Build up the new roles flag.
         uint256 rolesFlag;
         if (depositorFlag) {
             rolesFlag |= R_CAN_DEPOSIT;
@@ -318,12 +320,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         uint256 count = users.length;
         uint256 i;
         for (; i < count; i ++) {
-            user = users[i];
-            if (enableRoles) {
-                _addressRoles[user] |= rolesFlag;
-            } else {
-                _addressRoles[user] &= ~rolesFlag;
-            }
+            _addressRoles[users[i]] = rolesFlag;
 
             // Hello world!
             emit RoleChanged(user, _addressRoles[user]);
@@ -405,34 +402,6 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
         // Hello world!
         emit FilteringAdded(contractAddress);
-    }
-
-    /** Change the currently tracked contract. */
-    function changeContractAddress(address oldContract, address newContract) external {
-        uint256 index = _coreAddressIndices[oldContract];
-        require(
-            // Reentrancy guard.
-            (_status == S_NOT_ENTERED || _status == S_FROZEN)
-
-            // Caller must be an admin.
-            && (_addressRoles[msg.sender] & R_IS_ADMIN) == R_IS_ADMIN
-
-            // Make sure the address is an external contract that is currently being tracked. We don't do any validation on if the
-            // target address is a contract, or even if it supports `IERC1155`, since all interactions will revert if either of
-            // those are true.
-            && newContract != address(0)
-            && newContract != address(this)
-            && index > 0
-            && _contractTokenCounts[index - 1] == 0
-        , "Invalid parameters");
-
-        // Change the contract.
-        _coreAddresses[index - 1] = newContract;
-        _coreAddressIndices[oldContract] = 0;
-        _coreAddressIndices[newContract] = index;
-
-        // Hello world!
-        emit ContractAddressChanged(oldContract, newContract);
     }
 
     /** Clears the token filtering for a specific contract. */
@@ -643,6 +612,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
             // Check to see if we've already stored this token. If we have, then we only need to increase the tracked count.
             uint256 currentIndex = _indices[(contractIndex << CONTRACT_INDEX_OFFSET) | tokenId];
+            require(tokenCount + _contractTokenCounts[contractIndex - 1] >= tokenCount);
             _contractTokenCounts[contractIndex - 1] += tokenCount;
             if (currentIndex > 0) {
                 _tokenCounts[currentIndex - 1] += tokenCount;
@@ -665,8 +635,10 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
             // the intended token count value if they are trying to deposit more than they own. If they don't have any balance at all,
             // then we'll just move on to the next token.
             uint256 currentVaultBalance = tokenContract.balanceOf(address(this), tokenId);
+            require(tokenCount + currentVaultBalance >= tokenCount);
 
             // Track the true number to be minted.
+            require(tokenCount + mintCount >= tokenCount);
             mintCount += tokenCount;
 
             // Attempt to transfer the token. If the sender hasn't approved this contract for this specific token then it will fail.
@@ -684,6 +656,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
 
         // Give them the wrapped ERC-20 token.
         if (mintCount > 0) {
+            require((mintCount * _parityDepositAmount) / _parityDepositAmount == mintCount);
             _mint(depositor, mintCount * _parityDepositAmount);
         }
 
@@ -718,10 +691,14 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
         _status = S_ENTERED;
 
         // Attempt the withdrawal.
-        uint256 burnCount = _withdrawTokens(destination, index, count);
+        address tokenContract = _tokenContracts[index];
+        uint256 tokenId = _tokenIds[index];
+        uint256 contractIndex = _coreAddressIndices[tokenContract];
+        uint256 burnCount = _withdrawTokens(destination, index, IERC1155(tokenContract), tokenId, contractIndex, count);
 
         // Take the wrapped ERC-20 tokens.
         if (burnCount > 0) {
+            require((burnCount * _parityWithdrawalAmount) / _parityWithdrawalAmount == burnCount);
             _burn(msg.sender, burnCount * _parityWithdrawalAmount);
         }
 
@@ -782,11 +759,12 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
             ) {
                 continue;
             }
-            burnCount += _withdrawTokens(destination, tokenIndex, tokenCounts[i]);
+            burnCount += _withdrawTokens(destination, tokenIndex, IERC1155(tokenContract), tokenId, contractIndex, tokenCounts[i]);
         }
 
         // Take the wrapped ERC-20 tokens.
         if (burnCount > 0) {
+            require((burnCount * _parityWithdrawalAmount) / _parityWithdrawalAmount == burnCount);
             _burn(msg.sender, burnCount * _parityWithdrawalAmount);
         }
 
@@ -803,11 +781,7 @@ contract Vault1155ERM_V01 is ERC20, IERC1155Receiver {
      *
      * @return The number of withdrawn tokens.
      */
-    function _withdrawTokens(address destination, uint256 index, uint256 tokenCount) internal returns (uint256) {
-        IERC1155 tokenContract = IERC1155(_tokenContracts[index]);
-        uint256 tokenId = _tokenIds[index];
-        uint256 contractIndex = _coreAddressIndices[address(tokenContract)];
-
+    function _withdrawTokens(address destination, uint256 index, IERC1155 tokenContract, uint256 tokenId, uint256 contractIndex, uint256 tokenCount) internal returns (uint256) {
         // We can only withdraw as many as we have vaulted.
         if (_tokenCounts[index] <= tokenCount) {
             tokenCount = _tokenCounts[index];
